@@ -1,0 +1,916 @@
+import argparse
+import hashlib
+import json
+import logging
+import os
+import shutil
+import time
+from fnmatch import fnmatch
+from glob import glob
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from tempfile import NamedTemporaryFile
+import re
+
+import pandas as pd
+
+BASE = r"C:\Users\ElmarthyJanettyGalla\OneDrive - Weingart Center Association\QA Data Hub"
+
+CFG: Dict[str, Any] = {
+    "paths": {
+        "staging2": fr"{BASE}\Report Outputs\Second Staging Area",
+        "output":   fr"{BASE}\Report Outputs\Output",
+        "state_dir":fr"{BASE}\_pipeline_state",
+    },
+    "reader_defaults": {
+        "encoding": "utf-8",
+        "csv":   {"header": 0, "na_values": ["", "NA", "N/A", "null", "None"]},
+        "excel": {"sheet": "first", "header_row": 0},
+    },
+    "datasets": [
+        {
+            "name": "program_client_data",
+            "staging1": fr"{BASE}\Staging Area\Biweekly Report\Program Client Data",
+            "include_patterns": ["*.csv", "*.xlsx"],
+            "exclude_patterns": ["~$*", "*.tmp"],
+            "archive_after_process": True,
+            "combined_filename": "program_client_data.parquet",
+            "renames": {
+                "Clients Unique Identifier": "ClientID",
+                "Enrollments Active in Project": "ActiveInProject",
+                "Clients Client Full Name": "ClientFullName",
+                "Clients Active ROI?": "ActiveROI",
+                "Enrollments Days in Project": "DaysInProject",
+                "Enrollments Project Start Date": "ProjectStartDate",
+                "Client Custom Point of Contact Name": "POCName",
+                "Client Custom Point of Contact Phone": "POCPhone",
+                "Client Custom Point of Contact Email": "POCEmail",
+                "Client Custom Point of Contact Date": "POCDate",
+                "Clients DoB Data Quality": "DOBDataQuality",
+                "Clients SSN Data Quality": "SSNDataQuality",
+                "Clients SSN - Last 4": "SSN_Last4",
+                "Enrollments Deleted (Yes / No)": "EnrollmentDeleted",
+                "Client Assessment Custom TB Clearance Date": "TB_ClearanceDate",
+                "Programs Full Name": "ProgramName",
+                "Client Assessments Last Assessment ID": "LastAssessmentID",
+                "Client Assessments Last Assessment Date": "LastAssessmentDate",
+                "List of Client File Name": "ClientFileList",
+                "List of Assigned Staff": "AssignedStaff",
+            },
+            "date_rules": [
+                {"column": "ProjectStartDate",  "formats": ["%m/%d/%Y", "%Y-%m-%d"]},
+                {"column": "POCDate",           "formats": ["%m/%d/%Y", "%Y-%m-%d"]},
+                {"column": "LastAssessmentDate","formats": ["%m/%d/%Y", "%Y-%m-%d"]},
+                {"column": "TB_ClearanceDate",  "formats": ["%m/%d/%Y", "%Y-%m-%d"]},
+            ],
+            "dtypes": {
+                "ClientID": "string",
+                "ClientFullName": "string",
+                "ActiveROI": "string",
+                "ActiveInProject": "string",
+                "DaysInProject": "Int64",
+                "POCName": "string",
+                "POCPhone": "string",
+                "POCEmail": "string",
+                "DOBDataQuality": "string",
+                "SSNDataQuality": "string",
+                "SSN_Last4": "string",
+                "EnrollmentDeleted": "string",
+                "ProgramName": "string",
+                "LastAssessmentID": "string",
+                "ClientFileList": "string",
+                "AssignedStaff": "string",
+            },
+            "lowercase_columns": ["POCEmail"],
+            "drop_queries": [
+                "ClientID.isnull()",
+            ],
+            "drop_null_any": [],
+            "dedup_keys": ["ClientID", "ProgramName", "CreatedDate", "SourceFile"],
+            "recency_cols": ["POCDate", "LastAssessmentDate", "ProjectStartDate", "ExtractedAt"],
+        },
+        {
+            "name": "ces_assessments",
+            "staging1": fr"{BASE}\Staging Area\Biweekly Report\CES Assessments",
+            "include_patterns": ["*.csv", "*.xlsx"],
+            "exclude_patterns": ["~$*", "*.tmp"],
+            "archive_after_process": True,
+            "combined_filename": "ces_assessments.parquet",
+            "renames": {
+                "Clients Unique Identifier": "ClientID",
+                "Programs Full Name": "ProgramName",
+                "Client Assessments Assessment ID": "CES_AssessmentID",
+                "Client Assessments Assessment Date": "CES_AssessmentDate",
+                "Client Assessments Assessment Score": "CES_AssessmentScore",
+                "Client Assessments Is Coordinated Entry": "CES_IsCoordinatedEntry",
+            },
+            "date_rules": [
+                {"column": "CES_AssessmentDate", "formats": ["%Y-%m-%d", "%m/%d/%Y"]},
+            ],
+            "dtypes": {
+                "ClientID": "string",
+                "ProgramName": "string",
+                "CES_AssessmentID": "string",
+                "CES_AssessmentScore": "Int64",
+                "CES_IsCoordinatedEntry": "string",
+            },
+            "lowercase_columns": [],
+            "drop_queries": ["ClientID.isnull()"],
+            "drop_null_any": [],
+            "dedup_keys": ["ClientID", "ProgramName", "CreatedDate", "CES_AssessmentID", "SourceFile"],
+            "recency_cols": ["CES_AssessmentDate", "ExtractedAt"],
+        },
+        {
+            "name": "case_notes",
+            "staging1": fr"{BASE}\Staging Area\Biweekly Report\Case Notes",
+            "include_patterns": ["*.csv", "*.xlsx"],
+            "exclude_patterns": ["~$*", "*.tmp"],
+            "archive_after_process": True,
+            "combined_filename": "case_notes.parquet",
+            "renames": {},
+            "date_rules": [
+                {"column": "Month", "formats": ["%Y-%m", "%Y-%m-%d"]},
+            ],
+            "dtypes": {
+                "ClientID": "string",
+                "ProgramName": "string",
+                "CaseNoteCount": "Int64",
+            },
+            "lowercase_columns": [],
+            "drop_queries": ["ClientID.isnull()"],
+            "drop_null_any": [],
+            "dedup_keys": ["ClientID", "ProgramName", "Month", "ExtractedAt", "SourceFile"],
+            "recency_cols": ["ExtractedAt"],
+        },
+        {
+            "name": "services",
+            "staging1": fr"{BASE}\Staging Area\Biweekly Report\Services",
+            "include_patterns": ["*.csv", "*.xlsx"],
+            "exclude_patterns": ["~$*", "*.tmp"],
+            "archive_after_process": True,
+            "combined_filename": "services.parquet",
+            "renames": {
+                "Clients Unique Identifier": "ClientID",
+                "Programs Full Name": "ProgramName",
+                "Services Start Date Month": "ServicesMonth",
+                "Services Count": "ServicesCount",
+            },
+            "date_rules": [
+                {"column": "ServicesMonth", "formats": ["%Y-%m", "%m/%d/%Y"]},
+            ],
+            "dtypes": {
+                "ClientID": "string",
+                "ProgramName": "string",
+                "ServicesCount": "Int64",
+            },
+            "lowercase_columns": [],
+            "drop_queries": ["ClientID.isnull()"],
+            "drop_null_any": [],
+            "dedup_keys": ["ClientID", "ProgramName", "ServicesMonth", "ExtractedAt", "SourceFile"],
+            "recency_cols": ["ExtractedAt"],
+        },
+    ],
+    "output": {
+        "basename": "HMIS_Historical",
+        "final_view_basename": "WCA_Biweekly_Final",
+        "write_csv": True,
+        "write_parquet": True,
+        "write_excel": True,
+        "index": False
+    },
+    "logging": {"level": "INFO"}
+}
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def list_ingest_files(folder: Path, include: List[str], exclude: List[str]) -> List[Path]:
+    hits: List[Path] = []
+    for pat in include:
+        hits.extend([Path(p) for p in glob(str(folder / pat))])
+    files: List[Path] = []
+    for f in hits:
+        if any(fnmatch(f.name, ex) for ex in exclude):
+            continue
+        if f.is_file():
+            files.append(f)
+    return sorted(files)
+
+def md5_bytes(b: bytes) -> str:
+    m = hashlib.md5()
+    m.update(b)
+    return m.hexdigest()
+
+def read_bytes(p: Path) -> bytes:
+    with open(p, "rb") as f:
+        return f.read()
+
+def load_processed_log(state_dir: Path) -> Dict[str, Any]:
+    ensure_dir(state_dir)
+    p = state_dir / "processed_files.json"
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"files": {}}
+
+def save_processed_log(state_dir: Path, log: Dict[str, Any]) -> None:
+    ensure_dir(state_dir)
+    p = state_dir / "processed_files.json"
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2)
+
+def mark_processed(state_dir: Path, file_path: Path, md5sum: str) -> None:
+    log = load_processed_log(state_dir)
+    rel = str(file_path)
+    log["files"][rel] = {"md5": md5sum}
+    save_processed_log(state_dir, log)
+
+def is_already_processed(state_dir: Path, file_path: Path, md5sum: str) -> bool:
+    log = load_processed_log(state_dir)
+    rel = str(file_path)
+    entry = log["files"].get(rel)
+    return entry is not None and entry.get("md5") == md5sum
+
+def read_csv(fp: Path, defaults: Dict[str, Any]) -> pd.DataFrame:
+    encoding = defaults.get("encoding", "utf-8")
+    csv_cfg = defaults.get("csv", {})
+    try:
+        return pd.read_csv(fp, encoding=encoding, **csv_cfg)
+    except UnicodeDecodeError:
+        return pd.read_csv(fp, encoding="cp1252", **csv_cfg)
+
+def read_excel(fp: Path, defaults: Dict[str, Any]) -> pd.DataFrame:
+    xl = defaults.get("excel", {})
+    sheet = xl.get("sheet", "first")
+    header = xl.get("header_row", 0)
+    if isinstance(sheet, str) and sheet.lower() == "first":
+        sheet = 0
+    return pd.read_excel(fp, sheet_name=sheet, header=header)
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def ensure_unique_columns(df: pd.DataFrame, dataset_name: str = "") -> pd.DataFrame:
+    dup_mask = df.columns.duplicated(keep="first")
+    if dup_mask.any():
+        df = df.loc[:, ~dup_mask].copy()
+    return df
+
+def apply_column_renames(df: pd.DataFrame, renames: Dict[str, str]) -> pd.DataFrame:
+    if not renames:
+        return df
+    exist = {k: v for k, v in renames.items() if k in df.columns}
+    return df.rename(columns=exist)
+
+def parse_dates(df: pd.DataFrame, date_rules: List[Dict[str, Any]]) -> pd.DataFrame:
+    for r in date_rules:
+        col = r["column"]
+        if col not in df.columns:
+            continue
+        series = df[col]
+        fmts = r.get("formats")
+        if fmts:
+            out = pd.to_datetime(pd.Series([pd.NA] * len(df), index=df.index), errors="coerce")
+            for fmt in fmts:
+                attempt = pd.to_datetime(series, errors="coerce", format=fmt)
+                out = out.fillna(attempt)
+            df[col] = out
+        else:
+            df[col] = pd.to_datetime(series, errors="coerce")
+    return df
+
+def enforce_dtypes(df: pd.DataFrame, dtypes: Dict[str, str]) -> pd.DataFrame:
+    for col, dt in dtypes.items():
+        if col not in df.columns:
+            continue
+        try:
+            if dt == "string":
+                df[col] = df[col].astype("string")
+            else:
+                df[col] = df[col].astype(dt, errors="ignore")
+        except Exception:
+            pass
+    return df
+
+def trim_strings(df: pd.DataFrame) -> pd.DataFrame:
+    obj_cols = df.select_dtypes(include=["object", "string"]).columns
+    for c in obj_cols:
+        df[c] = df[c].astype("string").str.strip()
+    return df
+
+def to_lower(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype("string").str.lower()
+    return df
+
+def drop_bad_rows(df: pd.DataFrame, queries: List[str], null_any: List[str]) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+    for q in queries:
+        try:
+            bad_idx = df.query(q, engine="python").index
+            mask.loc[bad_idx] = False
+        except Exception:
+            continue
+    for col in null_any:
+        if col in df.columns:
+            mask &= df[col].notna()
+    return df.loc[mask]
+
+def deduplicate(df: pd.DataFrame, keys: List[str], recency_cols: List[str]) -> pd.DataFrame:
+    sort_cols = [c for c in recency_cols if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols)
+    if keys:
+        have_keys = pd.Series(True, index=df.index)
+        for k in keys:
+            if k in df.columns:
+                have_keys &= df[k].notna()
+        df = df.loc[have_keys]
+        df = df.drop_duplicates(subset=[k for k in keys if k in df.columns], keep="last")
+    else:
+        df = df.drop_duplicates(keep="last")
+    return df.reset_index(drop=True)
+
+def preprocess_case_notes_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ClientID","ProgramName","Month","CaseNoteCount","ExtractedAt"])
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    extracted = df["ExtractedAt"] if "ExtractedAt" in df.columns else pd.Series([pd.NaT]*len(df))
+    if {"ClientID","ProgramName","Month","CaseNoteCount"}.issubset(df.columns):
+        out = df[["ClientID","ProgramName","Month","CaseNoteCount"]].copy()
+        out["ExtractedAt"] = extracted.values
+        return out
+    if "Clients Unique Identifier" not in df.columns and len(df) >= 2:
+        new_cols = df.iloc[1].tolist()
+        df = df.iloc[2:].copy()
+        df.columns = [str(c).strip() for c in new_cols]
+        if "ExtractedAt" in df.columns:
+            extracted = df["ExtractedAt"]
+    df.columns = [str(c).strip() for c in df.columns]
+    lower_map = {c.lower(): c for c in df.columns}
+    def pick(possibles):
+        for p in possibles:
+            if p.lower() in lower_map:
+                return lower_map[p.lower()]
+        return None
+    id_col  = pick(["ClientID","Clients Unique Identifier"])
+    prg_col = pick(["ProgramName","Programs Full Name"])
+    if id_col is None or prg_col is None:
+        return pd.DataFrame(columns=["ClientID","ProgramName","Month","CaseNoteCount","ExtractedAt"])
+    df = df.rename(columns={id_col: "ClientID", prg_col: "ProgramName"})
+    month_cols = [c for c in df.columns if isinstance(c,str) and len(c)==7 and c[4]=="-" and c[:4].isdigit() and c[5:].isdigit()]
+    if month_cols:
+        tmp = df[["ClientID","ProgramName"] + month_cols].copy()
+        long_df = tmp.melt(id_vars=["ClientID","ProgramName"], value_vars=month_cols,
+                           var_name="Month", value_name="CaseNoteCount")
+        long_df["Month"] = pd.to_datetime(long_df["Month"], format="%Y-%m", errors="coerce")
+        long_df["CaseNoteCount"] = pd.to_numeric(long_df["CaseNoteCount"], errors="coerce")
+        long_df = long_df.dropna(subset=["ClientID"])
+        long_df["ExtractedAt"] = extracted.iloc[0] if len(extracted) else pd.NaT
+        return long_df[["ClientID","ProgramName","Month","CaseNoteCount","ExtractedAt"]]
+    count_like = [c for c in df.columns if str(c).startswith("Client Notes - Enrollment Level Count")]
+    if count_like:
+        today = pd.Timestamp.today().to_period("M")
+        periods = [today - i for i in range(len(count_like), 0, -1)]
+        long_rows = []
+        for i, col in enumerate(count_like):
+            period = periods[i] if i < len(periods) else today
+            tmp = df[["ClientID","ProgramName", col]].copy()
+            tmp["Month"] = period.to_timestamp()
+            tmp = tmp.rename(columns={col: "CaseNoteCount"})
+            tmp["ExtractedAt"] = extracted.iloc[0] if len(extracted) else pd.NaT
+            long_rows.append(tmp)
+        out = pd.concat(long_rows, ignore_index=True)
+        out["CaseNoteCount"] = pd.to_numeric(out["CaseNoteCount"], errors="coerce")
+        out = out.dropna(subset=["ClientID"])
+        return out[["ClientID","ProgramName","Month","CaseNoteCount","ExtractedAt"]]
+    return pd.DataFrame(columns=["ClientID","ProgramName","Month","CaseNoteCount","ExtractedAt"])
+
+def services_wide_all_months(services: pd.DataFrame) -> pd.DataFrame:
+    if services.empty or "ServicesMonth" not in services.columns:
+        return pd.DataFrame()
+    svc = services.copy()
+    svc["CreatedDate"] = pd.to_datetime(svc.get("ExtractedAt"), errors="coerce").dt.normalize()
+    svc["Period"] = svc["ServicesMonth"].dt.to_period("M")
+    if svc.empty:
+        return pd.DataFrame()
+    svc = svc.groupby(["ClientID","ProgramName","CreatedDate","Period"], as_index=False)["ServicesCount"].sum()
+    svc["Col"] = svc["Period"].apply(lambda p: f"{p.strftime('%B %Y')} Service Notes Count")
+    wide = svc.pivot_table(index=["ClientID","ProgramName","CreatedDate"],
+                           columns="Col", values="ServicesCount", aggfunc="sum").reset_index()
+    wide.columns.name = None
+    return wide
+
+def case_notes_wide_all_months(notes_long: pd.DataFrame) -> pd.DataFrame:
+    if notes_long.empty or "Month" not in notes_long.columns:
+        return pd.DataFrame()
+    cn = notes_long.copy()
+    cn["CreatedDate"] = pd.to_datetime(cn.get("ExtractedAt"), errors="coerce").dt.normalize()
+    cn["Period"] = cn["Month"].dt.to_period("M")
+    if cn.empty:
+        return pd.DataFrame()
+    cn = cn.groupby(["ClientID","ProgramName","CreatedDate","Period"], as_index=False)["CaseNoteCount"].sum()
+    cn["Col"] = cn["Period"].apply(lambda p: f"{p.strftime('%B %Y')} Case Notes")
+    wide = cn.pivot_table(index=["ClientID","ProgramName","CreatedDate"],
+                          columns="Col", values="CaseNoteCount", aggfunc="sum").reset_index()
+    wide.columns.name = None
+    return wide
+
+def ces_latest_as_of(ces: pd.DataFrame) -> pd.DataFrame:
+    if ces.empty:
+        return pd.DataFrame(columns=["ClientID","CreatedDate","Latest CES Assessment Date","CES Assessment Score"])
+    c = ces.copy()
+    c["CreatedDate"] = pd.to_datetime(c.get("ExtractedAt"), errors="coerce").dt.normalize()
+    c["CES_AssessmentDate"] = pd.to_datetime(c["CES_AssessmentDate"], errors="coerce")
+    c = c.dropna(subset=["ClientID","CreatedDate"])
+    c = c.sort_values(["ClientID","CreatedDate","CES_AssessmentDate"])
+    out_rows = []
+    for (cid, cd), group in c.groupby(["ClientID","CreatedDate"], sort=False):
+        g = group[group["CES_AssessmentDate"] <= cd]
+        if g.empty:
+            out_rows.append({"ClientID": cid, "CreatedDate": cd,
+                             "Latest CES Assessment Date": pd.NaT,
+                             "CES Assessment Score": pd.NA})
+        else:
+            last = g.tail(1).iloc[0]
+            out_rows.append({"ClientID": cid, "CreatedDate": cd,
+                             "Latest CES Assessment Date": last["CES_AssessmentDate"],
+                             "CES Assessment Score": last.get("CES_AssessmentScore", pd.NA)})
+    out = pd.DataFrame(out_rows)
+    return out
+
+def flags_from_filelist(df: pd.DataFrame) -> pd.DataFrame:
+    txt = df.get("ClientFileList", pd.Series(index=df.index, dtype="string")).astype("string").fillna("")
+    txt_norm = txt.str.replace("’", "'", regex=False)
+    def has(substr: str, s=txt_norm):
+        return s.str.contains(substr, case=False, na=False)
+    income_parts = [
+        ("Pay Stub", "Pay Stub"),
+        ("SSDI", "Supplemental Security Disability Income (SSDI) Forms"),
+        ("SSI", "Supplemental Security Income (SSI) Forms"),
+        ("GR", "General Relief (GR) Form"),
+        ("Food Stamp", "Food Stamp Card or Award Letter"),
+        ("CalWORKS", "CalWORKS Forms"),
+        ("Form 1087", "Form 1087 - Self Declaration of Income/No Income Form"),
+        ("Form 1084", "Form 1084 - 3rd Party Income Verification"),
+        ("Alimony Agreement", "Alimony Agreement"),
+        ("Social Security (NUMI) Printout", "Social Security (NUMI) Printout"),
+        ("Tax Return", "Tax Return"),
+        ("Veterans Affairs (VA) Benefits Award Letter", "Veterans Affairs (VA) Benefits Award Letter"),
+        ("Self Employment Document", "Self Employment Document"),
+        ("Other Financial Document", "Other Financial Document"),
+    ]
+    poilist = pd.Series("", index=df.index, dtype="string")
+    for label, needle in income_parts:
+        mask = has(needle)
+        poilist = poilist.mask(mask & (poilist == ""), label)
+        poilist = poilist.mask(mask & (poilist != ""), poilist + ", " + label)
+    df["Proof of Income"] = poilist.mask(poilist == "", "0").where(~(poilist == ""), "1 - " + poilist)
+    hilist = pd.Series("", index=df.index, dtype="string")
+    for label, needle in [("Medicare/Medicaid", "Medicaid or Medicare Card"),
+                          ("Other Health Insurance", "Health Insurance Documentation")]:
+        mask = has(needle)
+        hilist = hilist.mask(mask & (hilist == ""), label)
+        hilist = hilist.mask(mask & (hilist != ""), hilist + ", " + label)
+    df["Health Insurance"] = hilist.mask(hilist == "", "0").where(~(hilist == ""), "1 - " + hilist)
+    df["SSN Card"] = has("Social Security Card").astype(int)
+    df["Birth Certificate"] = has("Birth Certificate or Hospital Record of Birth").astype(int)
+    df["CDL or State ID"] = txt_norm.str.contains("Driver's License/State ID Card/Photo ID/ School Identification Card", case=False, na=False).astype(int)
+    df["Disability Verification"] = has("Disability Verification").astype(int)
+    return df
+
+def parse_date_from_name(name: str) -> Optional[pd.Timestamp]:
+    patterns = [r"(\d{1,2})[-_](\d{1,2})[-_](\d{4})"]
+    for pat in patterns:
+        m = re.findall(pat, name)
+        if m:
+            mm, dd, yyyy = m[-1]
+            try:
+                return pd.Timestamp(year=int(yyyy), month=int(mm), day=int(dd))
+            except Exception:
+                continue
+    return None
+
+def created_from_filename(fp: Path) -> pd.Timestamp:
+    ts = parse_date_from_name(fp.stem)
+    if ts is not None:
+        return ts
+    try:
+        return pd.Timestamp.fromtimestamp(fp.stat().st_mtime).tz_localize(None)
+    except Exception:
+        return pd.Timestamp.today().tz_localize(None)
+
+def backfill_created_from_sourcefile(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "SourceFile" not in df.columns:
+        return df
+    parsed = df["SourceFile"].astype(str).apply(lambda s: parse_date_from_name(Path(s).stem))
+    has = parsed.notna()
+    if has.any():
+        df.loc[has, "ExtractedAt"] = parsed[has].values
+        df.loc[has, "CreatedDate"] = pd.to_datetime(parsed[has]).dt.normalize().values
+    return df
+
+def build_final_view(staging2_dir: Path) -> pd.DataFrame:
+    prog = pd.read_parquet(staging2_dir / "program_client_data.parquet")
+    ces  = pd.read_parquet(staging2_dir / "ces_assessments.parquet") if (staging2_dir / "ces_assessments.parquet").exists() else pd.DataFrame()
+    notes= pd.read_parquet(staging2_dir / "case_notes.parquet") if (staging2_dir / "case_notes.parquet").exists() else pd.DataFrame()
+    serv = pd.read_parquet(staging2_dir / "services.parquet") if (staging2_dir / "services.parquet").exists() else pd.DataFrame()
+    prog = backfill_created_from_sourcefile(prog.copy())
+    notes = backfill_created_from_sourcefile(notes.copy())
+    serv  = backfill_created_from_sourcefile(serv.copy())
+    ces   = backfill_created_from_sourcefile(ces.copy())
+    prog["CreatedDate"] = pd.to_datetime(prog.get("ExtractedAt"), errors="coerce").dt.normalize()
+    notes_long = notes.copy()
+    if not notes_long.empty and "Month" not in notes_long.columns:
+        notes_long = preprocess_case_notes_to_long(notes_long)
+    notes_wide = case_notes_wide_all_months(notes_long) if not notes_long.empty else pd.DataFrame()
+    serv_wide  = services_wide_all_months(serv)         if not serv.empty      else pd.DataFrame()
+    ces_asof   = ces_latest_as_of(ces)                  if not ces.empty       else pd.DataFrame(columns=["ClientID","CreatedDate","Latest CES Assessment Date","CES Assessment Score"])
+    df = prog.copy()
+    if not notes_wide.empty:
+        df = df.merge(notes_wide, how="left", on=["ClientID","ProgramName","CreatedDate"])
+    if not serv_wide.empty:
+        df = df.merge(serv_wide,  how="left", on=["ClientID","ProgramName","CreatedDate"])
+    if not ces_asof.empty:
+        df = df.merge(ces_asof,   how="left", on=["ClientID","CreatedDate"])
+    df = flags_from_filelist(df)
+    today = pd.Timestamp.today().normalize()
+    def ces_status(dt):
+        if pd.isna(dt):
+            return "CES Not Done"
+        delta = (today - pd.to_datetime(dt)).days
+        return "Renewal Overdue" if delta > 730 else "Current"
+    df["CES Status"] = df["Latest CES Assessment Date"].apply(ces_status)
+    df["Document Ready"] = (
+        (df.get("CDL or State ID", 0).fillna(0).astype(int) == 1) &
+        (df.get("SSN Card", 0).fillna(0).astype(int) == 1) &
+        df.get("Proof of Income", "").astype("string").str.match(r"^1\b", na=False)
+    ).map({True: "Document Ready", False: "Not Document Ready"})
+    ces_score = pd.to_numeric(df.get("CES Assessment Score"), errors="coerce")
+    df["Housing Matching Ready"] = (
+        (df.get("CDL or State ID", 0).fillna(0).astype(int) == 1) &
+        (df.get("SSN Card", 0).fillna(0).astype(int) == 1) &
+        df.get("Proof of Income", "").astype("string").str.match(r"^1\b", na=False) &
+        (ces_score.fillna(0) >= 8)
+    ).map({True: "Housing Matching Ready", False: "Not Housing Matching Ready"})
+    days = pd.to_numeric(df.get("DaysInProject"), errors="coerce")
+    docs_ready = df["Document Ready"] != "Not Document Ready"
+    low_ces = ces_score.isna() | (ces_score < 8)
+    ces_expired = df["CES Status"].eq("Renewal Overdue")
+    long_stay = days.ge(120)
+    mid_stay  = days.ge(75) & days.lt(120)
+    alert = pd.Series(pd.NA, index=df.index, dtype="string")
+    alert = alert.mask(long_stay & ~docs_ready, "≥120 days & missing docs – ESCALATE")
+    alert = alert.mask(long_stay & ces_expired, "≥120 days & CES expired – ESCALATE")
+    alert = alert.mask(long_stay & low_ces, "≥120 days & CES<8 – ESCALATE")
+    alert = alert.mask(long_stay & ~(~docs_ready | ces_expired | low_ces), "≥120 days & docs/CES OK – monitor")
+    alert = alert.mask(mid_stay & ~docs_ready, "75–119 days & missing docs – ACTION")
+    alert = alert.mask(mid_stay & (ces_expired | low_ces), "75–119 days & CES risk – ACTION")
+    df["Intervention Alert"] = alert
+    rename_back = {
+        "ClientID": "Clients Unique Identifier",
+        "ActiveInProject": "Enrollments Active in Project",
+        "ClientFullName": "Clients Client Full Name",
+        "ActiveROI": "Clients Active ROI?",
+        "DaysInProject": "Enrollments Days in Project",
+        "ProjectStartDate": "Enrollments Project Start Date",
+        "POCName": "Client Custom Point of Contact Name",
+        "POCPhone": "Client Custom Point of Contact Phone",
+        "POCEmail": "Client Custom Point of Contact Email",
+        "POCDate": "Client Custom Point of Contact Date",
+        "DOBDataQuality": "Clients DoB Data Quality",
+        "SSNDataQuality": "Clients SSN Data Quality",
+        "TB_ClearanceDate": "Client Assessment Custom TB Clearance Date",
+        "ProgramName": "Programs Full Name",
+        "LastAssessmentID": "Client Assessments Last Assessment ID",
+        "LastAssessmentDate": "Client Assessments Last Assessment Date",
+        "AssignedStaff": "List of Assigned Staff",
+        "ClientFileList": "List of Client File Name",
+    }
+    df = df.rename(columns=rename_back)
+    for c in ["SSN Card","Birth Certificate","CDL or State ID","Disability Verification"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    if "Proof of Income" in df.columns:
+        df["Proof of Income"] = df["Proof of Income"].astype("string").fillna("0")
+    df["Date created"] = pd.to_datetime(df.get("CreatedDate"), errors="coerce").apply(lambda x: f"{x.month}/{x.day}/{x.year}" if not pd.isna(x) else pd.NA)
+    if "Bed Number" not in df.columns:
+        df["Bed Number"] = pd.NA
+    for col in [
+        "Enrollments Project Start Date",
+        "Client Custom Point of Contact Date",
+        "Client Assessments Last Assessment Date",
+        "Latest CES Assessment Date",
+        "Client Assessment Custom TB Clearance Date",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").apply(lambda x: f"{x.month}/{x.day}/{x.year}" if not pd.isna(x) else pd.NA)
+    front_cols = [
+        "Date created",
+        "Clients Unique Identifier",
+        "Enrollments Active in Project",
+        "Clients Client Full Name",
+        "Clients Active ROI?",
+        "Enrollments Days in Project",
+        "Enrollments Project Start Date",
+        "Client Custom Point of Contact Name",
+        "Client Custom Point of Contact Phone",
+        "Client Custom Point of Contact Email",
+        "Client Custom Point of Contact Date",
+        "Clients DoB Data Quality",
+        "Clients SSN Data Quality",
+        "Client Assessment Custom TB Clearance Date",
+        "Programs Full Name",
+        "Client Assessments Last Assessment ID",
+        "Client Assessments Last Assessment Date",
+        "List of Assigned Staff",
+        "SSN Card",
+        "Birth Certificate",
+        "CDL or State ID",
+        "Disability Verification",
+        "Proof of Income",
+        "Bed Number",
+    ]
+    month_cols = [c for c in df.columns if c.endswith(" Case Notes") or c.endswith(" Service Notes Count")]
+    tail_cols = [
+        "Latest CES Assessment Date",
+        "CES Assessment Score",
+        "CES Status",
+        "Document Ready",
+        "Housing Matching Ready",
+        "Intervention Alert",
+        "SourceFile",
+        "SourceDataset",
+    ]
+    for c in front_cols + month_cols + tail_cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df = df[front_cols + month_cols + tail_cols]
+    return df
+
+PREPROCESSORS = {"case_notes": preprocess_case_notes_to_long}
+
+def created_from_filename(fp: Path) -> pd.Timestamp:
+    ts = parse_date_from_name(fp.stem)
+    if ts is not None:
+        return ts
+    try:
+        return pd.Timestamp.fromtimestamp(fp.stat().st_mtime).tz_localize(None)
+    except Exception:
+        return pd.Timestamp.today().tz_localize(None)
+
+def process_dataset(
+    ds_cfg: Dict[str, Any],
+    staging2_dir: Path,
+    state_dir: Path,
+    reader_defaults: Dict[str, Any],
+    dry_run: bool=False
+) -> Optional[pd.DataFrame]:
+    name = ds_cfg["name"]
+    staging1 = Path(ds_cfg["staging1"])
+    include = ds_cfg.get("include_patterns", ["*.csv", "*.xlsx"])
+    exclude = ds_cfg.get("exclude_patterns", [])
+    archive = ds_cfg.get("archive_after_process", True)
+    combined_name = ds_cfg.get("combined_filename", f"{name}.parquet")
+    ensure_dir(staging1)
+    archive_dir = staging1 / "Archive"
+    if archive:
+        ensure_dir(archive_dir)
+    files = list_ingest_files(staging1, include, exclude)
+    if archive_dir.exists():
+        files += list_ingest_files(archive_dir, include, exclude)
+    files = sorted(set(files))
+    logging.info(f"[{name}] Found {len(files)} candidate file(s).")
+    ensure_dir(staging2_dir)
+    combined_path = staging2_dir / combined_name
+    if combined_path.exists():
+        combined = pd.read_parquet(combined_path)
+        combined = backfill_created_from_sourcefile(combined)
+        logging.info(f"[{name}] Loaded combined ({len(combined):,} rows).")
+    else:
+        combined = pd.DataFrame()
+        logging.info(f"[{name}] No existing combined; starting fresh.")
+    new_rows = []
+    for f in files:
+        try:
+            b = read_bytes(f)
+            checksum = md5_bytes(b)
+            if is_already_processed(state_dir, f, checksum):
+                logging.info(f"[{name}] Skip (already processed): {f.name}")
+                continue
+            if f.suffix.lower() == ".csv":
+                df = read_csv(f, reader_defaults)
+            elif f.suffix.lower() in [".xlsx", ".xls"]:
+                df = read_excel(f, reader_defaults)
+            else:
+                logging.info(f"[{name}] Skip unsupported type: {f.name}")
+                continue
+            if df is None or df.empty:
+                logging.info(f"[{name}] Empty/unreadable: {f.name}")
+                continue
+            df = normalize_columns(df)
+            df = ensure_unique_columns(df, dataset_name=name)
+            pre_fn = PREPROCESSORS.get(name)
+            if pre_fn:
+                try:
+                    df = pre_fn(df)
+                except Exception as e:
+                    logging.exception(f"[{name}] Preprocess failed for {f.name}: {e}")
+            extracted = created_from_filename(f)
+            df["ExtractedAt"] = extracted
+            df["CreatedDate"] = pd.to_datetime(extracted).normalize()
+            df["SourceFile"] = f.name
+            df["SourceDataset"] = name
+            new_rows.append(df)
+            logging.info(f"[{name}] Ingested {f.name} ({len(df):,} rows).")
+            if not dry_run and f.parent == staging1 and archive:
+                mark_processed(state_dir, f, checksum)
+                dest = archive_dir / f.name
+                counter = 1
+                while dest.exists():
+                    stem, ext = os.path.splitext(f.name)
+                    dest = archive_dir / f"{stem} ({counter}){ext}"
+                    counter += 1
+                shutil.move(str(f), str(dest))
+                logging.info(f"[{name}] Archived -> {dest.name}")
+        except Exception as e:
+            logging.exception(f"[{name}] Failed ingest for {f}: {e}")
+    if new_rows:
+        batch = pd.concat(new_rows, ignore_index=True)
+        combined = pd.concat([combined, batch], ignore_index=True) if not combined.empty else batch
+        logging.info(f"[{name}] Appended {len(batch):,} new rows; combined now {len(combined):,}")
+    else:
+        logging.info(f"[{name}] No new rows this run.")
+    combined = ensure_unique_columns(combined, dataset_name=f"{name}-post_rename")
+    combined = apply_column_renames(combined, ds_cfg.get("renames", {}))
+    combined = ensure_unique_columns(combined, dataset_name=f"{name}-post_rename")
+    combined = combined.reset_index(drop=True)
+    combined = parse_dates(combined, ds_cfg.get("date_rules", []))
+    combined = enforce_dtypes(combined, ds_cfg.get("dtypes", {}))
+    combined = trim_strings(combined)
+    combined = to_lower(combined, ds_cfg.get("lowercase_columns", []))
+    combined = drop_bad_rows(combined, ds_cfg.get("drop_queries", []), ds_cfg.get("drop_null_any", []))
+    combined = deduplicate(combined, ds_cfg.get("dedup_keys", []), ds_cfg.get("recency_cols", []))
+    if not dry_run:
+        combined.to_parquet(combined_path, index=False)
+        logging.info(f"[{name}] Wrote combined parquet to {combined_path} ({len(combined):,} rows).")
+    else:
+        logging.info(f"[{name}] [Dry-run] Would write combined parquet to {combined_path}.")
+    return combined
+
+def merge_all(datasets: List[Dict[str, Any]], staging2_dir: Path) -> pd.DataFrame:
+    base_cfg = next(ds for ds in datasets if ds["name"] == "program_client_data")
+    prog = pd.read_parquet(staging2_dir / base_cfg["combined_filename"])
+    prog = backfill_created_from_sourcefile(prog)
+    prog["CreatedDate"] = pd.to_datetime(prog["ExtractedAt"], errors="coerce").dt.normalize()
+    out_df = prog.copy()
+    cn = next(ds for ds in datasets if ds["name"] == "case_notes")
+    sv = next(ds for ds in datasets if ds["name"] == "services")
+    ce = next(ds for ds in datasets if ds["name"] == "ces_assessments")
+    def load_and_fix(ds):
+        p = staging2_dir / ds["combined_filename"]
+        if not p.exists():
+            return pd.DataFrame()
+        df = pd.read_parquet(p)
+        df = backfill_created_from_sourcefile(df)
+        df["CreatedDate"] = pd.to_datetime(df.get("ExtractedAt"), errors="coerce").dt.normalize()
+        return df
+    case_df = load_and_fix(cn)
+    serv_df = load_and_fix(sv)
+    ces_df  = load_and_fix(ce)
+    if not case_df.empty:
+        out_df = out_df.merge(case_df, how="left", on=["ClientID","ProgramName","CreatedDate"], suffixes=("","__case_notes"))
+        logging.info(f"[merge] Program ⟵ Case Notes on ['ClientID','ProgramName','CreatedDate'] -> {len(out_df):,}")
+    if not serv_df.empty:
+        out_df = out_df.merge(serv_df, how="left", on=["ClientID","ProgramName","CreatedDate"], suffixes=("","__services"))
+        logging.info(f"[merge] + Services on ['ClientID','ProgramName','CreatedDate'] -> {len(out_df):,}")
+    if not ces_df.empty:
+        out_df = out_df.merge(ces_df, how="left", on=["ClientID","CreatedDate"], suffixes=("","__ces"))
+        logging.info(f"[merge] + CES on ['ClientID','CreatedDate'] -> {len(out_df):,}")
+    return out_df
+
+def atomic_write_csv(df: pd.DataFrame, path: Path, **kwargs):
+    path = Path(path)
+    ensure_dir(path.parent)
+    attempts = 12
+    delay = 2
+    last_err = None
+    for _ in range(attempts):
+        tmp_path = None
+        try:
+            with NamedTemporaryFile("w", delete=False, dir=path.parent, suffix=".tmp", encoding=kwargs.pop("encoding", "utf-8-sig"), newline="") as tf:
+                tmp_path = Path(tf.name)
+            df.to_csv(tmp_path, **kwargs)
+            try:
+                tmp_path.replace(path)
+            except PermissionError:
+                time.sleep(delay)
+                tmp_path.replace(path)
+            return
+        except PermissionError as e:
+            last_err = e
+            try:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            time.sleep(delay)
+    if last_err:
+        raise last_err
+
+def atomic_write_parquet(df: pd.DataFrame, path: Path, **kwargs):
+    path = Path(path)
+    ensure_dir(path.parent)
+    attempts = 12
+    delay = 2
+    last_err = None
+    for _ in range(attempts):
+        tmp_path = None
+        try:
+            with NamedTemporaryFile("wb", delete=False, dir=path.parent, suffix=".tmp") as tf:
+                tmp_path = Path(tf.name)
+            df.to_parquet(tmp_path, **kwargs)
+            try:
+                tmp_path.replace(path)
+            except PermissionError:
+                time.sleep(delay)
+                tmp_path.replace(path)
+            return
+        except PermissionError as e:
+            last_err = e
+            try:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            time.sleep(delay)
+    if last_err:
+        raise last_err
+
+def write_excel_splitting(df: pd.DataFrame, out_path_base: Path, sheet_name: str = "Sheet1", max_rows: int = 1_000_000):
+    ensure_dir(out_path_base.parent)
+    n = len(df)
+    if n == 0:
+        with pd.ExcelWriter(out_path_base.with_suffix(".xlsx"), engine="openpyxl") as xw:
+            pd.DataFrame().to_excel(xw, index=False, sheet_name=sheet_name)
+        return
+    parts = (n + max_rows - 1) // max_rows
+    if parts == 1:
+        tmp = out_path_base.with_suffix(".xlsx").with_name(out_path_base.with_suffix(".xlsx").name + ".tmp")
+        with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name=sheet_name)
+        Path(tmp).replace(out_path_base.with_suffix(".xlsx"))
+    else:
+        for i in range(parts):
+            lo = i * max_rows
+            hi = min((i + 1) * max_rows, n)
+            part_df = df.iloc[lo:hi].copy()
+            part_path = out_path_base.with_name(out_path_base.stem + f"_part{i+1}").with_suffix(".xlsx")
+            tmp = part_path.with_name(part_path.name + ".tmp")
+            with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
+                part_df.to_excel(xw, index=False, sheet_name=sheet_name)
+            Path(tmp).replace(part_path)
+
+def run_pipeline(cfg: Dict[str, Any], dry_run: bool=False):
+    logging.basicConfig(level=getattr(logging, cfg.get("logging", {}).get("level", "INFO")))
+    logging.info("=== Starting HMIS ETL (single-file) ===")
+    staging2_dir = Path(cfg["paths"]["staging2"])
+    output_dir   = Path(cfg["paths"]["output"])
+    state_dir    = Path(cfg["paths"]["state_dir"])
+    for p in [staging2_dir, output_dir, state_dir]:
+        ensure_dir(p)
+    reader_defaults = cfg["reader_defaults"]
+    datasets = cfg["datasets"]
+    for ds in datasets:
+        process_dataset(ds, staging2_dir, state_dir, reader_defaults, dry_run=dry_run)
+    if dry_run:
+        logging.info("[Dry-run] Skipping merge and outputs.")
+        logging.info("=== Done (dry-run) ===")
+        return
+    final_df = merge_all(datasets, staging2_dir)
+    out = cfg["output"]
+    if out.get("write_parquet", True):
+        atomic_write_parquet(final_df, output_dir / f"{out['basename']}.parquet", index=out.get("index", False))
+    if out.get("write_csv", True):
+        atomic_write_csv(final_df, output_dir / f"{out['basename']}.csv", index=out.get("index", False))
+    if out.get("write_excel", True):
+        write_excel_splitting(final_df, output_dir / out['basename'])
+    curated = build_final_view(staging2_dir)
+    vb = out.get("final_view_basename", "WCA_Biweekly_Final")
+    if out.get("write_parquet", True):
+        atomic_write_parquet(curated, output_dir / f"{vb}.parquet", index=out.get("index", False))
+    if out.get("write_csv", True):
+        atomic_write_csv(curated, output_dir / f"{vb}.csv", index=out.get("index", False))
+    if out.get("write_excel", True):
+        write_excel_splitting(curated, output_dir / vb)
+    logging.info(f"[output] Wrote {out['basename']}.* and {vb}.* to {output_dir}")
+    logging.info("=== Pipeline complete ===")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Biweekly HMIS ETL (full-history final view + Excel export)")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    run_pipeline(CFG, dry_run=args.dry_run)
