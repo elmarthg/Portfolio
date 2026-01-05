@@ -1,0 +1,22 @@
+# HMIS Medallion ETL (Python + pandas)
+
+Production-style ETL pipeline for homeless services analytics (HMIS/CES, case notes, services, enrollments).  
+Designed for auditability, deterministic logic, and non-technical coworker execution.
+
+## Objectives
+
+- Transform HMIS exports and locally maintained CES files into clean, join-ready datasets
+- Build reporting-ready “Gold” tables with deterministic business rules and flags
+- Preserve lineage and reproducibility (file manifests, QA outputs, deterministic sorting)
+- Support coworker execution with minimal steps and consistent outcomes
+
+## Architecture
+
+This project implements a **Medallion Architecture** using free tools:
+
+- **Bronze**: Raw extracts (CSV/Excel) as received (no business logic)
+- **Silver**: Cleaned, normalized, typed, and join-ready tables
+- **Gold**: Business logic, KPIs, readiness flags, and reporting tables
+
+All outputs are partitioned by `pull_date`:
+
