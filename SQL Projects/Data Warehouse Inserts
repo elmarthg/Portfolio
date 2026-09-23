@@ -1,0 +1,539 @@
+-- =====================================================================
+-- 04_load_all (v2 — aligned to warehouse schema v5)
+-- Reloads dim_program, dim_client, bridge_client_source, fact_enrollment
+-- in dependency order. Safe to re-run: every statement is idempotent.
+--
+-- v2 changes vs v1:
+--   - dim_program: program_key removed from INSERT (IDENTITY in v5).
+--   - fact_enrollment: assessment_date removed (dropped in v4/v5).
+--   - fact_enrollment: orphan rows routed to stage_load_reject and not
+--     loaded with NULL FKs. Facts never carry unresolved keys.
+--   - bridge_client_source populated for every new SF/CIS client
+--     (single-source cluster for now; cross-source matching is a
+--     separate Silver step).
+--   - All join keys normalized: UPPER + trim + collapse tabs/CR/LF.
+--   - Added client_key / program_key NULL checks and reject-log checks.
+--
+-- NOTE: stg_sf_cis_client.county_name  →  dim_client.county
+--
+-- NOTE: This script joins dim_client on s.salesforce_id. If your
+--       enrollment staging holds the client's SF ID in a different
+--       column (e.g. client_salesforce_id) rather than reusing
+--       salesforce_id, change the joins in section 5 accordingly.
+--       The preflight in section 5b will surface the mismatch.
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- 1. dim_program — insert new
+-- ---------------------------------------------------------------------
+INSERT INTO dim_program (program_name, source_system, load_datetime)
+SELECT
+    s.program_name,
+    s.source_system,
+    SYSDATETIME()
+FROM (
+    SELECT
+        LTRIM(RTRIM(program_name))  AS program_name,
+        LTRIM(RTRIM(source_system)) AS source_system,
+        ROW_NUMBER() OVER (
+            PARTITION BY LTRIM(RTRIM(program_name)),
+                         LTRIM(RTRIM(source_system))
+            ORDER BY program_name
+        ) AS rn
+    FROM stg_sf_cis_program
+    WHERE program_name IS NOT NULL
+      AND source_system IS NOT NULL
+) s
+WHERE s.rn = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM dim_program d
+    WHERE UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(d.program_name)),
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' '))
+        = UPPER(REPLACE(REPLACE(REPLACE(s.program_name,
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' '))
+      AND UPPER(LTRIM(RTRIM(d.source_system))) = UPPER(s.source_system)
+);
+
+-- If staging carries a stable program ID (salesforce_program_id),
+-- add it to the column list above and use it as the business key
+-- instead of program_name. Recommended once available.
+
+
+-- ---------------------------------------------------------------------
+-- 2. dim_client — insert new
+--    New v5 crosswalk columns (hmis_client_id, champ_client_id,
+--    ssn_hash, gender_identity, sexual_orientation) left NULL.
+-- ---------------------------------------------------------------------
+INSERT INTO dim_client (
+    salesforce_id, salesforce_account_id, external_id,
+    first_name, middle_name, last_name,
+    date_of_birth, sex, gender, race, ethnicity,
+    marital_status, number_of_children, education_level,
+    email, home_phone, mobile_phone,
+    address_line1, city, state, postal_code,
+    county,
+    veteran_status,
+    military_branch, military_service_component, discharge_status,
+    military_entry_date, military_discharge_date, is_post_9_11,
+    service_connected, period_of_service,
+    disability_status, mental_health_condition, substance_abuse,
+    homeless_status, housing_status, length_of_homelessness, times_homeless_3yr,
+    has_conviction, conviction_type, conviction_date,
+    probation_parole_status, parole_end_date, last_release_date,
+    experience_during_incarceration,
+    service_type, lead_source,
+    source_system, owner_id, created_by_id, created_date,
+    last_modified_date, is_deleted, load_datetime
+)
+SELECT
+    s.salesforce_id, s.salesforce_account_id, s.external_id,
+    s.first_name, s.middle_name, s.last_name,
+    s.date_of_birth, s.sex, s.gender, s.race, s.ethnicity,
+    s.marital_status, s.number_of_children, s.education_level,
+    s.email, s.home_phone, s.mobile_phone,
+    s.address_line1, s.city, s.state, s.postal_code,
+    s.county_name,
+    s.veteran_status,
+    s.military_branch, s.military_service_component, s.discharge_status,
+    s.military_entry_date, s.military_discharge_date, s.is_post_9_11,
+    s.service_connected, s.period_of_service,
+    s.disability_status, s.mental_health_condition, s.substance_abuse,
+    s.homeless_status, s.housing_status, s.length_of_homelessness, s.times_homeless_3yr,
+    s.has_conviction, s.conviction_type, s.conviction_date,
+    s.probation_parole_status, s.parole_end_date, s.last_release_date,
+    s.experience_during_incarceration,
+    s.service_type, s.lead_source,
+    s.source_system, s.owner_id, s.created_by_id, s.created_date,
+    s.last_modified_date, s.is_deleted,
+    SYSDATETIME()
+FROM (
+    SELECT
+        *,
+        LTRIM(RTRIM(salesforce_id))  AS salesforce_id_clean,
+        LTRIM(RTRIM(source_system))  AS source_system_clean,
+        ROW_NUMBER() OVER (
+            PARTITION BY LTRIM(RTRIM(salesforce_id)),
+                         LTRIM(RTRIM(source_system))
+            ORDER BY ISNULL(last_modified_date,'1900-01-01') DESC
+        ) AS rn
+    FROM stg_sf_cis_client
+    WHERE salesforce_id IS NOT NULL
+      AND source_system IS NOT NULL
+) s
+WHERE s.rn = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM dim_client d
+    WHERE UPPER(LTRIM(RTRIM(d.salesforce_id)))  = UPPER(s.salesforce_id_clean)
+      AND UPPER(LTRIM(RTRIM(d.source_system)))  = UPPER(s.source_system_clean)
+);
+
+
+-- ---------------------------------------------------------------------
+-- 3. dim_client — update existing
+-- ---------------------------------------------------------------------
+UPDATE d
+SET d.first_name              = s.first_name,
+    d.middle_name             = s.middle_name,
+    d.last_name               = s.last_name,
+    d.date_of_birth           = s.date_of_birth,
+    d.sex                     = s.sex,
+    d.gender                  = s.gender,
+    d.race                    = s.race,
+    d.ethnicity               = s.ethnicity,
+    d.marital_status          = s.marital_status,
+    d.number_of_children      = s.number_of_children,
+    d.education_level         = s.education_level,
+    d.email                   = s.email,
+    d.home_phone              = s.home_phone,
+    d.mobile_phone            = s.mobile_phone,
+    d.address_line1           = s.address_line1,
+    d.city                    = s.city,
+    d.state                   = s.state,
+    d.postal_code             = s.postal_code,
+    d.county                  = s.county_name,
+    d.veteran_status          = s.veteran_status,
+    d.military_branch         = s.military_branch,
+    d.military_service_component = s.military_service_component,
+    d.discharge_status        = s.discharge_status,
+    d.military_entry_date     = s.military_entry_date,
+    d.military_discharge_date = s.military_discharge_date,
+    d.is_post_9_11            = s.is_post_9_11,
+    d.service_connected       = s.service_connected,
+    d.period_of_service       = s.period_of_service,
+    d.disability_status       = s.disability_status,
+    d.mental_health_condition = s.mental_health_condition,
+    d.substance_abuse         = s.substance_abuse,
+    d.homeless_status         = s.homeless_status,
+    d.housing_status          = s.housing_status,
+    d.length_of_homelessness  = s.length_of_homelessness,
+    d.times_homeless_3yr      = s.times_homeless_3yr,
+    d.has_conviction          = s.has_conviction,
+    d.conviction_type         = s.conviction_type,
+    d.conviction_date         = s.conviction_date,
+    d.probation_parole_status = s.probation_parole_status,
+    d.parole_end_date         = s.parole_end_date,
+    d.last_release_date       = s.last_release_date,
+    d.experience_during_incarceration = s.experience_during_incarceration,
+    d.service_type            = s.service_type,
+    d.lead_source             = s.lead_source,
+    d.last_modified_date      = s.last_modified_date,
+    d.is_deleted              = s.is_deleted,
+    d.load_datetime           = SYSDATETIME()
+FROM (
+    SELECT
+        *,
+        LTRIM(RTRIM(salesforce_id)) AS salesforce_id_clean,
+        LTRIM(RTRIM(source_system)) AS source_system_clean,
+        ROW_NUMBER() OVER (
+            PARTITION BY LTRIM(RTRIM(salesforce_id)),
+                         LTRIM(RTRIM(source_system))
+            ORDER BY ISNULL(last_modified_date,'1900-01-01') DESC
+        ) AS rn
+    FROM stg_sf_cis_client
+    WHERE salesforce_id IS NOT NULL
+      AND source_system IS NOT NULL
+) s
+INNER JOIN dim_client d
+    ON UPPER(LTRIM(RTRIM(d.salesforce_id))) = UPPER(s.salesforce_id_clean)
+   AND UPPER(LTRIM(RTRIM(d.source_system))) = UPPER(s.source_system_clean)
+WHERE s.rn = 1;
+
+
+-- ---------------------------------------------------------------------
+-- 4. bridge_client_source — populate for every SF/CIS client that does
+--    not yet have a bridge row. Single-source cluster for now; when
+--    HMIS/WellSky/Apricot land, a separate Silver step will re-point
+--    them onto their golden client_key and deactivate any duplicates.
+-- ---------------------------------------------------------------------
+INSERT INTO bridge_client_source (
+    client_key, source_system, source_client_id, source_personal_id,
+    match_method, match_confidence, matched_by, matched_date,
+    is_active, load_datetime
+)
+SELECT
+    d.client_key,
+    'sf_cis',
+    LTRIM(RTRIM(d.salesforce_id)),
+    NULL,
+    'single_source',
+    1.0000,
+    'system',
+    SYSDATETIME(),
+    1,
+    SYSDATETIME()
+FROM dim_client d
+WHERE UPPER(LTRIM(RTRIM(d.source_system))) = 'SF_CIS'
+  AND d.salesforce_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM bridge_client_source b
+    WHERE UPPER(LTRIM(RTRIM(b.source_system)))    = 'SF_CIS'
+      AND UPPER(LTRIM(RTRIM(b.source_client_id))) = UPPER(LTRIM(RTRIM(d.salesforce_id)))
+);
+
+
+-- ---------------------------------------------------------------------
+-- 5. fact_enrollment — stage resolved rows in a temp table.
+--    Same normalization applied here as in the joins.
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS #enrollment_resolved;
+
+SELECT
+    s.*,
+    c.client_key,
+    p.program_key
+INTO #enrollment_resolved
+FROM (
+    SELECT
+        *,
+        LTRIM(RTRIM(salesforce_id))  AS salesforce_id_clean,
+        LTRIM(RTRIM(source_system))  AS source_system_clean,
+        UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(salesforce_id)),
+              CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) AS salesforce_key,
+        UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(program_name)),
+              CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) AS program_key_norm,
+        UPPER(LTRIM(RTRIM(source_system))) AS source_system_key,
+        ROW_NUMBER() OVER (
+            PARTITION BY LTRIM(RTRIM(salesforce_id)),
+                         LTRIM(RTRIM(source_system))
+            ORDER BY ISNULL(enrollment_start_date,'1900-01-01') DESC
+        ) AS rn
+    FROM stg_sf_cis_enrollment
+    WHERE salesforce_id IS NOT NULL
+      AND source_system IS NOT NULL
+      AND enrollment_start_date IS NOT NULL
+) s
+LEFT JOIN dim_client c
+    ON UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(c.salesforce_id)),
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) = s.salesforce_key
+   AND UPPER(LTRIM(RTRIM(c.source_system))) = s.source_system_key
+LEFT JOIN dim_program p
+    ON UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(p.program_name)),
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) = s.program_key_norm
+   AND UPPER(LTRIM(RTRIM(p.source_system))) = s.source_system_key
+WHERE s.rn = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM fact_enrollment f
+    WHERE UPPER(LTRIM(RTRIM(f.source_record_id))) = s.salesforce_key
+      AND UPPER(LTRIM(RTRIM(f.source_system)))    = s.source_system_key
+  );
+
+
+-- ---------------------------------------------------------------------
+-- 5b. Preflight — surface orphans before they are logged/loaded.
+--     Run this first and eyeball it if the reject count is unexpectedly high.
+-- ---------------------------------------------------------------------
+SELECT
+    CASE
+        WHEN client_key  IS NULL AND program_key IS NULL THEN 'orphan_client_and_program'
+        WHEN client_key  IS NULL                         THEN 'orphan_client'
+        ELSE 'orphan_program'
+    END                  AS orphan_type,
+    source_system_clean,
+    salesforce_id_clean  AS enrollment_salesforce_id,
+    program_name         AS referenced_program
+FROM #enrollment_resolved
+WHERE client_key IS NULL OR program_key IS NULL
+ORDER BY orphan_type, source_system_clean, salesforce_id_clean;
+
+
+-- ---------------------------------------------------------------------
+-- 5c. Log rejects — one row per orphan, with reason and referenced keys.
+--     These rows are NOT loaded into fact_enrollment.
+-- ---------------------------------------------------------------------
+INSERT INTO stage_load_reject (
+    source_system, entity_name, source_record_id, reject_reason,
+    referenced_client_id, referenced_program, detected_datetime
+)
+SELECT
+    source_system_clean,
+    'fact_enrollment',
+    salesforce_id_clean,
+    CASE
+        WHEN client_key  IS NULL AND program_key IS NULL THEN 'orphan_client_and_program'
+        WHEN client_key  IS NULL                         THEN 'orphan_client'
+        ELSE 'orphan_program'
+    END,
+    salesforce_id_clean,
+    program_name,
+    SYSDATETIME()
+FROM #enrollment_resolved
+WHERE client_key IS NULL OR program_key IS NULL;
+
+
+-- ---------------------------------------------------------------------
+-- 5d. Insert only fully resolved enrollments.
+--     v5 lineage columns (source_enrollment_id, source_client_id,
+--     source_household_id, source_personal_id) populated where derivable;
+--     HUD-context columns (relationship_to_hoh, prior_living_situation,
+--     etc.) left NULL — they are filled by future HMIS/WellSky feeds.
+-- ---------------------------------------------------------------------
+INSERT INTO fact_enrollment (
+    client_key,
+    program_key,
+    enrollment_start_date,
+    enrollment_exit_date,
+    placement_date,
+    enrollment_status,
+    grant_name,
+    service_type,
+    is_carry_over,
+    referral_agency,
+    referred_to_workforce,
+    workforce_referral_name,
+    is_placed,
+    starting_hourly_wage,
+    source_system,
+    source_record_id,
+    source_enrollment_id,
+    source_client_id,
+    load_datetime
+)
+SELECT
+    r.client_key,
+    r.program_key,
+    r.enrollment_start_date,
+    r.enrollment_exit_date,
+    r.placement_date,
+    r.enrollment_status,
+    r.grant_name,
+    r.service_type,
+    r.is_carry_over,
+    r.referral_agency,
+    r.referred_to_workforce,
+    r.workforce_referral_name,
+    r.is_placed,
+    r.starting_hourly_wage,
+    r.source_system_clean,
+    r.salesforce_id_clean,
+    r.salesforce_id_clean,   -- SF enrollment IS the source record
+    r.salesforce_id_clean,   -- SF enrollment's client ref (see header note)
+    SYSDATETIME()
+FROM #enrollment_resolved r
+WHERE r.client_key  IS NOT NULL
+  AND r.program_key IS NOT NULL;
+
+
+-- ---------------------------------------------------------------------
+-- 6. fact_enrollment — update existing
+--    assessment_date removed (dropped in v4/v5).
+--    Same normalization applied to the join.
+-- ---------------------------------------------------------------------
+UPDATE f
+SET f.client_key              = c.client_key,
+    f.program_key             = p.program_key,
+    f.enrollment_start_date   = s.enrollment_start_date,
+    f.enrollment_exit_date    = s.enrollment_exit_date,
+    f.placement_date          = s.placement_date,
+    f.enrollment_status       = s.enrollment_status,
+    f.grant_name              = s.grant_name,
+    f.service_type            = s.service_type,
+    f.is_carry_over           = s.is_carry_over,
+    f.referral_agency         = s.referral_agency,
+    f.referred_to_workforce   = s.referred_to_workforce,
+    f.workforce_referral_name = s.workforce_referral_name,
+    f.is_placed               = s.is_placed,
+    f.starting_hourly_wage    = s.starting_hourly_wage,
+    f.load_datetime           = SYSDATETIME()
+FROM fact_enrollment f
+INNER JOIN (
+    SELECT
+        *,
+        LTRIM(RTRIM(salesforce_id)) AS salesforce_id_clean,
+        LTRIM(RTRIM(source_system)) AS source_system_clean,
+        UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(salesforce_id)),
+              CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) AS salesforce_key,
+        UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(program_name)),
+              CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) AS program_key_norm,
+        UPPER(LTRIM(RTRIM(source_system))) AS source_system_key,
+        ROW_NUMBER() OVER (
+            PARTITION BY LTRIM(RTRIM(salesforce_id)),
+                         LTRIM(RTRIM(source_system))
+            ORDER BY ISNULL(enrollment_start_date,'1900-01-01') DESC
+        ) AS rn
+    FROM stg_sf_cis_enrollment
+    WHERE salesforce_id IS NOT NULL
+      AND source_system IS NOT NULL
+) s
+    ON UPPER(LTRIM(RTRIM(f.source_record_id))) = s.salesforce_key
+   AND UPPER(LTRIM(RTRIM(f.source_system)))    = s.source_system_key
+LEFT JOIN dim_client c
+    ON UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(c.salesforce_id)),
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) = s.salesforce_key
+   AND UPPER(LTRIM(RTRIM(c.source_system))) = s.source_system_key
+LEFT JOIN dim_program p
+    ON UPPER(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(p.program_name)),
+             CHAR(9),' '), CHAR(10),' '), CHAR(13),' ')) = s.program_key_norm
+   AND UPPER(LTRIM(RTRIM(p.source_system))) = s.source_system_key
+WHERE s.rn = 1;
+
+
+-- ---------------------------------------------------------------------
+-- 7. Verify dim_client
+-- ---------------------------------------------------------------------
+SELECT COUNT(*)                  AS total,
+       COUNT(veteran_status)     AS with_veteran_status,
+       COUNT(period_of_service)  AS with_period_of_service,
+       COUNT(county)             AS with_county
+FROM dim_client;
+
+SELECT COUNT(*) AS bridge_rows,
+       COUNT(DISTINCT client_key) AS distinct_clients_mapped
+FROM bridge_client_source
+WHERE is_active = 1;
+
+
+-- ---------------------------------------------------------------------
+-- 8. Verify fact_enrollment
+-- ---------------------------------------------------------------------
+SELECT COUNT(*)                   AS total,
+       COUNT(grant_name)          AS with_grant,
+       COUNT(DISTINCT grant_name) AS distinct_grants
+FROM fact_enrollment;
+
+SELECT grant_name, COUNT(*) AS cnt
+FROM fact_enrollment
+WHERE grant_name IS NOT NULL
+GROUP BY grant_name
+ORDER BY cnt DESC;
+
+
+-- ---------------------------------------------------------------------
+-- 9. Row counts across the pipeline
+-- ---------------------------------------------------------------------
+SELECT 'stg_sf_cis_client'      AS table_name, COUNT(*) AS row_count FROM stg_sf_cis_client
+UNION ALL SELECT 'dim_client',                COUNT(*) FROM dim_client
+UNION ALL SELECT 'bridge_client_source',      COUNT(*) FROM bridge_client_source
+UNION ALL SELECT 'stg_sf_cis_program',        COUNT(*) FROM stg_sf_cis_program
+UNION ALL SELECT 'dim_program',               COUNT(*) FROM dim_program
+UNION ALL SELECT 'stg_sf_cis_enrollment',     COUNT(*) FROM stg_sf_cis_enrollment
+UNION ALL SELECT 'fact_enrollment',           COUNT(*) FROM fact_enrollment
+UNION ALL SELECT 'dim_household',             COUNT(*) FROM dim_household
+UNION ALL SELECT 'stage_load_reject',         COUNT(*) FROM stage_load_reject
+ORDER BY table_name;
+
+
+-- ---------------------------------------------------------------------
+-- 10. Data-integrity checks — every value should be 0
+-- ---------------------------------------------------------------------
+SELECT 'fact dup (source_record_id + source_system)' AS check_name, COUNT(*) AS problem_rows
+FROM (
+    SELECT source_record_id, source_system FROM fact_enrollment
+    GROUP BY source_record_id, source_system HAVING COUNT(*) > 1
+) x
+UNION ALL
+SELECT 'fact NULL source_record_id', COUNT(*) FROM fact_enrollment WHERE source_record_id IS NULL
+UNION ALL
+SELECT 'fact NULL source_system',    COUNT(*) FROM fact_enrollment WHERE source_system IS NULL
+UNION ALL
+SELECT 'fact NULL client_key',       COUNT(*) FROM fact_enrollment WHERE client_key IS NULL
+UNION ALL
+SELECT 'fact NULL program_key',      COUNT(*) FROM fact_enrollment WHERE program_key IS NULL
+UNION ALL
+SELECT 'dim_client dup (salesforce_id + source_system)', COUNT(*)
+FROM (
+    SELECT salesforce_id, source_system FROM dim_client
+    GROUP BY salesforce_id, source_system HAVING COUNT(*) > 1
+) x
+UNION ALL
+SELECT 'dim_program dup (program_name + source_system)', COUNT(*)
+FROM (
+    SELECT program_name, source_system FROM dim_program
+    GROUP BY program_name, source_system HAVING COUNT(*) > 1
+) x
+UNION ALL
+SELECT 'bridge dup (source_system + source_client_id)', COUNT(*)
+FROM (
+    SELECT source_system, source_client_id FROM bridge_client_source
+    WHERE is_active = 1
+    GROUP BY source_system, source_client_id HAVING COUNT(*) > 1
+) x;
+
+
+-- ---------------------------------------------------------------------
+-- 11. Reject log review — one row per orphan, read after every load
+-- ---------------------------------------------------------------------
+SELECT reject_reason,
+       COUNT(*) AS cnt
+FROM stage_load_reject
+WHERE detected_datetime >= DATEADD(day, -1, SYSDATETIME())
+GROUP BY reject_reason
+ORDER BY cnt DESC;
+
+-- Uncomment to inspect individual orphan rows:
+-- SELECT TOP 100 * FROM stage_load_reject
+-- WHERE detected_datetime >= DATEADD(day, -1, SYSDATETIME())
+-- ORDER BY detected_datetime DESC;
+
+
+-- ---------------------------------------------------------------------
+-- 12. Spot check — placements by program
+-- ---------------------------------------------------------------------
+SELECT
+    ISNULL(p.program_name, '(no program)') AS program,
+    COUNT(*) AS enrollments,
+    SUM(CASE WHEN f.placement_date IS NOT NULL THEN 1 ELSE 0 END) AS placements
+FROM fact_enrollment f
+LEFT JOIN dim_program p ON p.program_key = f.program_key
+GROUP BY p.program_name
+ORDER BY enrollments DESC;
