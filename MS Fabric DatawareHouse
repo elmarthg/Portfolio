@@ -193,3 +193,224 @@ FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_NAME IN ('dim_household','dim_client','dim_program','fact_enrollment')
 GROUP BY TABLE_NAME
 ORDER BY TABLE_NAME;
+
+
+
+
+-- =====================================================================
+-- TSA SoCal Fabric Warehouse — Multi-Source Extension
+-- Sources: HMIS/CHAMP (Clarity), WellSky, Apricot, Salesforce/CIS
+-- Pattern: source-specific crosswalks on dimensions + universal columns
+-- Approach: ALTER existing tables, CREATE new ones. Preserves data.
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- PART 1: dim_client
+-- ---------------------------------------------------------------------
+
+-- Second HMIS crosswalk. If hmis_la_id already holds the Clarity
+-- Personal ID (unique_identifier), keep it and add hmis_client_id for
+-- the internal id. If hmis_la_id holds the internal id, rename it and
+-- skip adding hmis_client_id below.
+ALTER TABLE dim_client ADD hmis_client_id           VARCHAR(50);   -- Clarity internal id
+ALTER TABLE dim_client ADD hmis_personal_id         VARCHAR(50);   -- Clarity unique_identifier
+
+-- Universal identity attributes (populated by any source that collects them)
+ALTER TABLE dim_client ADD ssn                      VARCHAR(20);
+ALTER TABLE dim_client ADD name_data_quality        VARCHAR(50);
+ALTER TABLE dim_client ADD ssn_data_quality         VARCHAR(50);
+ALTER TABLE dim_client ADD dob_data_quality         VARCHAR(50);
+ALTER TABLE dim_client ADD gender_identity          VARCHAR(255);  -- distinct from 'gender'
+ALTER TABLE dim_client ADD sexual_orientation       VARCHAR(100);
+ALTER TABLE dim_client ADD race_detail              VARCHAR(500);  -- HUD 3.04.2-style detail
+ALTER TABLE dim_client ADD source_agency            VARCHAR(255);
+ALTER TABLE dim_client ADD source_added_date        DATETIME2(6);
+ALTER TABLE dim_client ADD source_last_updated      DATETIME2(6);
+
+-- ---------------------------------------------------------------------
+-- PART 2: dim_household
+-- ---------------------------------------------------------------------
+
+ALTER TABLE dim_household ADD hmis_household_id     VARCHAR(50);   -- Clarity household id
+ALTER TABLE dim_household ADD source_agency         VARCHAR(255);
+ALTER TABLE dim_household ADD source_added_date     DATETIME2(6);
+ALTER TABLE dim_household ADD source_last_updated   DATETIME2(6);
+
+-- ---------------------------------------------------------------------
+-- PART 3: dim_program
+-- ---------------------------------------------------------------------
+
+ALTER TABLE dim_program ADD hmis_project_id         VARCHAR(50);   -- Clarity project id
+ALTER TABLE dim_program ADD program_status          VARCHAR(50);   -- active / inactive
+ALTER TABLE dim_program ADD cross_agency            BIT;           -- can serve clients from other agencies
+ALTER TABLE dim_program ADD availability_start_date DATE;
+ALTER TABLE dim_program ADD availability_end_date   DATE;
+
+-- ---------------------------------------------------------------------
+-- PART 4: fact_enrollment
+-- ---------------------------------------------------------------------
+
+-- Widen source_record_id: VARCHAR(18) is Salesforce-sized; Clarity and
+-- WellSky IDs can be longer.
+ALTER TABLE fact_enrollment ALTER COLUMN source_record_id VARCHAR(50);
+
+-- Universal enrollment attributes
+ALTER TABLE fact_enrollment ADD source_enrollment_id   VARCHAR(50);
+ALTER TABLE fact_enrollment ADD source_client_id       VARCHAR(50);
+ALTER TABLE fact_enrollment ADD source_household_id    VARCHAR(50);
+ALTER TABLE fact_enrollment ADD relationship_to_hoh    VARCHAR(100);
+ALTER TABLE fact_enrollment ADD is_head_of_household   BIT;
+ALTER TABLE fact_enrollment ADD data_collection_stage  VARCHAR(50);   -- Entry / Update / Annual / Exit
+ALTER TABLE fact_enrollment ADD housing_move_in_date   DATE;
+ALTER TABLE fact_enrollment ADD in_permanent_housing   VARCHAR(20);
+ALTER TABLE fact_enrollment ADD prior_living_situation VARCHAR(255);
+ALTER TABLE fact_enrollment ADD length_of_stay_prior   VARCHAR(100);
+ALTER TABLE fact_enrollment ADD project_type_code      INT;
+ALTER TABLE fact_enrollment ADD continuum_code         VARCHAR(20);   -- CoC / region code (universal)
+ALTER TABLE fact_enrollment ADD source_file_name       VARCHAR(255);  -- lineage
+ALTER TABLE fact_enrollment ADD source_file_date       DATE;
+
+-- ---------------------------------------------------------------------
+-- PART 5: fact_service — NEW, universal grain
+-- Grain: one row per service per enrollment
+-- ---------------------------------------------------------------------
+
+CREATE TABLE fact_service (
+    service_key             BIGINT IDENTITY NOT NULL,
+    client_key              BIGINT,
+    program_key             INT,
+    enrollment_key          BIGINT,
+    -- source lineage
+    source_system           VARCHAR(50),      -- 'hmis_clarity','wellsky','apricot_cis'
+    source_record_id        VARCHAR(50),
+    source_service_id       VARCHAR(50),
+    source_enrollment_id    VARCHAR(50),
+    source_client_id        VARCHAR(50),
+    -- service definition
+    service_item_code       VARCHAR(50),
+    service_item_name       VARCHAR(255),
+    service_category        VARCHAR(255),
+    service_subcategory     VARCHAR(255),
+    -- dates
+    service_start_date      DATE,
+    service_end_date        DATE,
+    service_result_date     DATE,
+    -- measures / content
+    service_amount          DECIMAL(18,2),
+    service_notes           VARCHAR(MAX),
+    -- HUD-specific (null for non-HMIS sources)
+    safe_alternative_housing VARCHAR(20),
+    aftercare_project       VARCHAR(255),
+    -- lineage
+    source_file_name        VARCHAR(255),
+    source_file_date        DATE,
+    load_datetime           DATETIME2(6)
+);
+
+-- ---------------------------------------------------------------------
+-- PART 6: fact_case_note — NEW, universal
+-- ACCESS NOTE: contains free-text. Confirm scope with Pam/Maddy before
+-- enabling in production.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE fact_case_note (
+    note_key                BIGINT IDENTITY NOT NULL,
+    client_key              BIGINT,
+    program_key             INT,
+    enrollment_key          BIGINT,
+    -- source lineage
+    source_system           VARCHAR(50),
+    source_record_id        VARCHAR(50),
+    source_note_id          VARCHAR(50),
+    source_enrollment_id    VARCHAR(50),
+    source_client_id        VARCHAR(50),
+    -- note content
+    note_title              VARCHAR(500),
+    note_content            VARCHAR(MAX),
+    note_date               DATE,
+    note_author             VARCHAR(255),
+    note_category           VARCHAR(100),
+    time_tracked_minutes    INT,
+    is_private              BIT,
+    -- lineage
+    source_file_name        VARCHAR(255),
+    source_file_date        DATE,
+    load_datetime           DATETIME2(6)
+);
+
+-- ---------------------------------------------------------------------
+-- PART 7: stage_load_log — NEW, pipeline idempotency
+-- ---------------------------------------------------------------------
+
+CREATE TABLE stage_load_log (
+    load_log_key            BIGINT IDENTITY NOT NULL,
+    source_system           VARCHAR(50),
+    entity_name             VARCHAR(100),     -- 'client','household','program','enrollment','service','case_note'
+    source_file_name        VARCHAR(255),
+    source_file_date        DATE,
+    bronze_load_datetime    DATETIME2(6),
+    silver_load_datetime    DATETIME2(6),
+    warehouse_load_datetime DATETIME2(6),
+    row_count_source        INT,
+    row_count_loaded        INT,
+    load_status             VARCHAR(50),      -- 'success','partial','failed'
+    error_message           VARCHAR(MAX)
+);
+
+-- ---------------------------------------------------------------------
+-- PART 8: CONSTRAINTS
+-- ---------------------------------------------------------------------
+
+ALTER TABLE fact_service ADD CONSTRAINT PK_fact_service
+    PRIMARY KEY NONCLUSTERED (service_key) NOT ENFORCED;
+
+ALTER TABLE fact_case_note ADD CONSTRAINT PK_fact_case_note
+    PRIMARY KEY NONCLUSTERED (note_key) NOT ENFORCED;
+
+ALTER TABLE stage_load_log ADD CONSTRAINT PK_stage_load_log
+    PRIMARY KEY NONCLUSTERED (load_log_key) NOT ENFORCED;
+
+ALTER TABLE fact_service ADD CONSTRAINT FK_fact_service_enrollment
+    FOREIGN KEY (enrollment_key) REFERENCES fact_enrollment(enrollment_key) NOT ENFORCED;
+ALTER TABLE fact_service ADD CONSTRAINT FK_fact_service_client
+    FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
+ALTER TABLE fact_service ADD CONSTRAINT FK_fact_service_program
+    FOREIGN KEY (program_key) REFERENCES dim_program(program_key) NOT ENFORCED;
+
+ALTER TABLE fact_case_note ADD CONSTRAINT FK_fact_case_note_enrollment
+    FOREIGN KEY (enrollment_key) REFERENCES fact_enrollment(enrollment_key) NOT ENFORCED;
+ALTER TABLE fact_case_note ADD CONSTRAINT FK_fact_case_note_client
+    FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
+ALTER TABLE fact_case_note ADD CONSTRAINT FK_fact_case_note_program
+    FOREIGN KEY (program_key) REFERENCES dim_program(program_key) NOT ENFORCED;
+
+-- ---------------------------------------------------------------------
+-- PART 9: VERIFY
+-- ---------------------------------------------------------------------
+
+-- New columns on existing tables
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME IN ('dim_client','dim_household','dim_program','fact_enrollment')
+  AND (COLUMN_NAME LIKE 'hmis_%' 
+       OR COLUMN_NAME LIKE 'source_%'
+       OR COLUMN_NAME IN (
+           'ssn','name_data_quality','ssn_data_quality','dob_data_quality',
+           'gender_identity','sexual_orientation','race_detail',
+           'program_status','cross_agency',
+           'availability_start_date','availability_end_date',
+           'relationship_to_hoh','is_head_of_household',
+           'data_collection_stage','housing_move_in_date',
+           'in_permanent_housing','prior_living_situation',
+           'length_of_stay_prior','project_type_code','continuum_code'
+       ))
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+-- New tables
+SELECT TABLE_NAME, COUNT(*) AS column_count
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME IN ('fact_service','fact_case_note','stage_load_log')
+GROUP BY TABLE_NAME
+ORDER BY TABLE_NAME;
+
+
