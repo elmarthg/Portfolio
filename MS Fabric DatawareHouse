@@ -1,0 +1,195 @@
+DROP TABLE IF EXISTS fact_enrollment;
+DROP TABLE IF EXISTS dim_client;
+DROP TABLE IF EXISTS dim_program;
+DROP TABLE IF EXISTS dim_household;
+
+-- ---------------------------------------------------------------------
+-- DIMENSIONS
+-- ---------------------------------------------------------------------
+
+CREATE TABLE dim_household (
+    household_key         INT NOT NULL,
+    -- crosswalk
+    salesforce_id         VARCHAR(18),
+    apricot_record_id     VARCHAR(50),
+    wellsky_household_id  VARCHAR(50),
+    -- attributes
+    household_name        VARCHAR(255),
+    household_type        VARCHAR(50),
+    household_size        INT,
+    address_line1         VARCHAR(255),
+    city                  VARCHAR(100),
+    state                 VARCHAR(2),
+    postal_code           VARCHAR(20),
+    -- housekeeping
+    source_system         VARCHAR(50),
+    created_date          DATETIME2(6),
+    last_modified_date    DATETIME2(6),
+    is_deleted            BIT,
+    load_datetime         DATETIME2(6)
+);
+
+CREATE TABLE dim_client (
+    client_key            BIGINT IDENTITY NOT NULL,   -- generated surrogate key
+    household_key         INT,
+    salesforce_id         VARCHAR(18),
+    salesforce_account_id VARCHAR(18),
+    external_id           VARCHAR(50),
+    apricot_record_id     VARCHAR(50),
+    wellsky_client_uid    VARCHAR(50),
+    hmis_la_id            VARCHAR(50),
+    first_name            VARCHAR(100),
+    middle_name           VARCHAR(100),
+    last_name             VARCHAR(100),
+    date_of_birth         DATE,
+    sex                   VARCHAR(50),
+    gender                VARCHAR(50),
+    race                  VARCHAR(255),
+    ethnicity             VARCHAR(50),
+    marital_status        VARCHAR(50),
+    number_of_children    VARCHAR(50),
+    education_level       VARCHAR(100),
+
+    -- contact
+    email                 VARCHAR(255),
+    home_phone            VARCHAR(30),
+    mobile_phone          VARCHAR(30),
+    address_line1         VARCHAR(255),
+    city                  VARCHAR(100),
+    state                 VARCHAR(2),
+    postal_code           VARCHAR(20),
+
+    -- military
+    military_branch            VARCHAR(50),
+    military_service_component VARCHAR(50),
+    discharge_status           VARCHAR(50),
+    military_entry_date        DATE,
+    military_discharge_date    DATE,
+    is_post_9_11               VARCHAR(20),
+    service_connected          VARCHAR(50),
+
+    -- barriers
+    disability_status       VARCHAR(50),
+    mental_health_condition VARCHAR(50),
+    substance_abuse         VARCHAR(50),
+
+    -- homelessness
+    homeless_status        VARCHAR(50),
+    housing_status         VARCHAR(100),
+    length_of_homelessness VARCHAR(100),
+    times_homeless_3yr     VARCHAR(50),
+
+    -- justice involvement
+    has_conviction                  VARCHAR(50),
+    conviction_type                 VARCHAR(255),
+    conviction_date                 DATE,
+    probation_parole_status         VARCHAR(50),
+    parole_end_date                 DATE,
+    last_release_date               DATE,
+    experience_during_incarceration VARCHAR(255),
+
+    -- other
+    service_type          VARCHAR(100),
+    lead_source           VARCHAR(100),
+
+    -- formerly ALTER TABLE ADD
+    period_of_service     VARCHAR(255),
+    veteran_status        VARCHAR(50),
+    county                VARCHAR(100),
+
+    -- housekeeping
+    source_system         VARCHAR(50),
+    owner_id              VARCHAR(18),
+    created_by_id         VARCHAR(18),
+    created_date          DATETIME2(6),
+    last_modified_date    DATETIME2(6),
+    is_deleted            BIT,
+    load_datetime         DATETIME2(6)
+);
+
+CREATE TABLE dim_program (
+    program_key       INT NOT NULL,
+    program_name      VARCHAR(255),
+
+    -- formerly ALTER TABLE ADD
+    organization_key  BIGINT,
+    project_type      INT,
+    coc_code          VARCHAR(20),
+    city              VARCHAR(100),
+    state             VARCHAR(10),
+    county            VARCHAR(100),
+
+    source_system     VARCHAR(50),
+    load_datetime     DATETIME2(6)
+);
+
+-- ---------------------------------------------------------------------
+-- FACTS
+-- ---------------------------------------------------------------------
+
+CREATE TABLE fact_enrollment (
+    enrollment_key          BIGINT IDENTITY NOT NULL,   -- generated surrogate key
+    -- foreign keys (surrogates, resolved at load time)
+    client_key              BIGINT,                     -- matches dim_client.client_key
+    program_key             INT,
+    -- dates
+    enrollment_start_date   DATE,
+    enrollment_exit_date    DATE,
+    assessment_date         DATE,
+    placement_date          DATE,
+    -- attributes
+    enrollment_status       VARCHAR(50),
+    service_type            VARCHAR(100),
+    is_carry_over           VARCHAR(20),
+    referral_agency         VARCHAR(255),
+    referred_to_workforce   VARCHAR(50),
+    workforce_referral_name VARCHAR(255),
+    is_placed               VARCHAR(20),
+
+    -- formerly ALTER TABLE ADD
+    grant_name              VARCHAR(255),
+
+    -- measures
+    starting_hourly_wage    DECIMAL(10,2),
+    -- lineage
+    source_system           VARCHAR(50),
+    source_record_id        VARCHAR(18),
+    load_datetime           DATETIME2(6)
+);
+
+-- ---------------------------------------------------------------------
+-- CONSTRAINTS  (NOT ENFORCED — Fabric does not support enforcement)
+-- Useful for the query optimizer and Power BI relationship detection.
+-- Integrity is enforced by the Stage 5 validation queries, not by these.
+-- ---------------------------------------------------------------------
+
+ALTER TABLE dim_household ADD CONSTRAINT PK_dim_household
+    PRIMARY KEY NONCLUSTERED (household_key) NOT ENFORCED;
+
+ALTER TABLE dim_client ADD CONSTRAINT PK_dim_client
+    PRIMARY KEY NONCLUSTERED (client_key) NOT ENFORCED;
+
+ALTER TABLE dim_program ADD CONSTRAINT PK_dim_program
+    PRIMARY KEY NONCLUSTERED (program_key) NOT ENFORCED;
+
+ALTER TABLE fact_enrollment ADD CONSTRAINT PK_fact_enrollment
+    PRIMARY KEY NONCLUSTERED (enrollment_key) NOT ENFORCED;
+
+ALTER TABLE dim_client ADD CONSTRAINT FK_dim_client_household
+    FOREIGN KEY (household_key) REFERENCES dim_household(household_key) NOT ENFORCED;
+
+ALTER TABLE fact_enrollment ADD CONSTRAINT FK_fact_enrollment_client
+    FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
+
+ALTER TABLE fact_enrollment ADD CONSTRAINT FK_fact_enrollment_program
+    FOREIGN KEY (program_key) REFERENCES dim_program(program_key) NOT ENFORCED;
+
+-- ---------------------------------------------------------------------
+-- VERIFY
+-- ---------------------------------------------------------------------
+
+SELECT TABLE_NAME, COUNT(*) AS column_count
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME IN ('dim_household','dim_client','dim_program','fact_enrollment')
+GROUP BY TABLE_NAME
+ORDER BY TABLE_NAME;
