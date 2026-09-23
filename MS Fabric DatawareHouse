@@ -1,5 +1,5 @@
 -- =====================================================================
--- TSA SoCal Fabric Warehouse Schema (v4 — Final)
+-- TSA SoCal Fabric Warehouse Schema (v5.1 — Canonical)
 -- Sources: HMIS/CHAMP (Clarity), WellSky, Apricot, Salesforce/CIS
 --
 -- RESTRICTED: do not populate until access scope and consent basis are
@@ -10,11 +10,18 @@
 --
 -- PENDING (Apricot uniform core model): Assessment, Disabilities,
 -- Income and Benefits, Exit, Document.
+--
+-- v5.1 changes vs v5:
+--   - bridge_client_source added in DROP / BRIDGES / CONSTRAINTS / VERIFY
+--     sections (was appended out of order in v5).
 -- =====================================================================
 
+DROP TABLE IF EXISTS stage_load_reject;
+DROP TABLE IF EXISTS stage_load_log;
 DROP TABLE IF EXISTS fact_case_note;
 DROP TABLE IF EXISTS fact_service;
 DROP TABLE IF EXISTS fact_enrollment;
+DROP TABLE IF EXISTS bridge_client_source;
 DROP TABLE IF EXISTS bridge_household_client;
 DROP TABLE IF EXISTS dim_client;
 DROP TABLE IF EXISTS dim_program;
@@ -22,7 +29,6 @@ DROP TABLE IF EXISTS dim_organization;
 DROP TABLE IF EXISTS dim_household;
 DROP TABLE IF EXISTS dim_service_item;
 DROP TABLE IF EXISTS dim_date;
-DROP TABLE IF EXISTS stage_load_log;
 
 -- ---------------------------------------------------------------------
 -- DIMENSIONS
@@ -53,26 +59,26 @@ CREATE TABLE dim_household (
 );
 
 CREATE TABLE dim_organization (
-    organization_key      BIGINT IDENTITY NOT NULL,
-    salesforce_id         VARCHAR(18),
-    apricot_record_id     VARCHAR(50),
+    organization_key        BIGINT IDENTITY NOT NULL,
+    salesforce_id           VARCHAR(18),
+    apricot_record_id       VARCHAR(50),
     wellsky_organization_id VARCHAR(50),
-    hmis_organization_id  VARCHAR(50),
-    organization_name     VARCHAR(255),
-    organization_phone    VARCHAR(30),
-    address_line1         VARCHAR(255),
-    city                  VARCHAR(100),
-    state                 VARCHAR(10),
-    postal_code           VARCHAR(20),
-    county                VARCHAR(100),
-    coc_code              VARCHAR(20),
+    hmis_organization_id    VARCHAR(50),
+    organization_name       VARCHAR(255),
+    organization_phone      VARCHAR(30),
+    address_line1           VARCHAR(255),
+    city                    VARCHAR(100),
+    state                   VARCHAR(10),
+    postal_code             VARCHAR(20),
+    county                  VARCHAR(100),
+    coc_code                VARCHAR(20),
     victim_service_provider BIT,
-    source_system         VARCHAR(50),
-    source_agency         VARCHAR(255),
-    source_added_date     DATETIME2(6),
-    source_last_updated   DATETIME2(6),
-    is_deleted            BIT,
-    load_datetime         DATETIME2(6)
+    source_system           VARCHAR(50),
+    source_agency           VARCHAR(255),
+    source_added_date       DATETIME2(6),
+    source_last_updated     DATETIME2(6),
+    is_deleted              BIT,
+    load_datetime           DATETIME2(6)
 );
 
 -- household_key reflects CURRENT household only. Historical membership
@@ -83,12 +89,12 @@ CREATE TABLE dim_client (
 
     salesforce_id         VARCHAR(18),
     salesforce_account_id VARCHAR(18),
-    external_id           VARCHAR(50),   -- generic crosswalk
+    external_id           VARCHAR(50),
     apricot_record_id     VARCHAR(50),
     wellsky_client_uid    VARCHAR(50),
     hmis_client_id        VARCHAR(50),
     hmis_personal_id      VARCHAR(50),
-    champ_client_id       VARCHAR(50),   -- placeholder pending CHAMP scope
+    champ_client_id       VARCHAR(50),
 
     first_name            VARCHAR(100),
     middle_name           VARCHAR(100),
@@ -166,12 +172,11 @@ CREATE TABLE dim_program (
     program_key             BIGINT IDENTITY NOT NULL,
     program_name            VARCHAR(255),
     organization_key        BIGINT,
-    -- crosswalk
     hmis_project_id         VARCHAR(50),
     wellsky_program_id      VARCHAR(50),
     apricot_record_id       VARCHAR(50),
     salesforce_id           VARCHAR(18),
-    -- attributes
+    salesforce_program_id   VARCHAR(18),
     project_type            INT,
     coc_code                VARCHAR(20),
     city                    VARCHAR(100),
@@ -181,12 +186,10 @@ CREATE TABLE dim_program (
     cross_agency            BIT,
     availability_start_date DATE,
     availability_end_date   DATE,
-    -- housekeeping
     source_system           VARCHAR(50),
     load_datetime           DATETIME2(6)
 );
 
--- Resolves service_item_code/name to canonical values across sources.
 CREATE TABLE dim_service_item (
     service_item_key      BIGINT IDENTITY NOT NULL,
     service_item_code     VARCHAR(50),
@@ -219,7 +222,7 @@ CREATE TABLE dim_date (
 -- BRIDGES
 -- ---------------------------------------------------------------------
 
--- Historical household membership. grain: household + client + period.
+-- Historical household membership. Grain: household + client + period.
 CREATE TABLE bridge_household_client (
     household_client_key  BIGINT IDENTITY NOT NULL,
     household_key         BIGINT,
@@ -235,12 +238,28 @@ CREATE TABLE bridge_household_client (
     load_datetime         DATETIME2(6)
 );
 
+-- Maps every source-system client record to its golden dim_client row.
+-- Many-to-one. Enables cross-source dedup and merge audit without
+-- changing facts (which reference client_key only).
+CREATE TABLE bridge_client_source (
+    client_source_key    BIGINT IDENTITY NOT NULL,
+    client_key           BIGINT,
+    source_system        VARCHAR(50),
+    source_client_id     VARCHAR(50),
+    source_personal_id   VARCHAR(50),
+    match_method         VARCHAR(50),      -- 'single_source','exact_id','fuzzy_name_dob','manual'
+    match_confidence     DECIMAL(5,4),     -- 0.0000–1.0000
+    matched_by           VARCHAR(100),
+    matched_date         DATETIME2(6),
+    is_active            BIT,              -- false after an un-merge
+    notes                VARCHAR(MAX),
+    load_datetime        DATETIME2(6)
+);
+
 -- ---------------------------------------------------------------------
 -- FACTS
 -- ---------------------------------------------------------------------
 
--- client_key is denormalized from dim_client; Stage 5 validation must
--- confirm consistency with dim_client and with the enrollment record.
 CREATE TABLE fact_enrollment (
     enrollment_key          BIGINT IDENTITY NOT NULL,
     client_key              BIGINT,
@@ -267,7 +286,6 @@ CREATE TABLE fact_enrollment (
     project_type_code       INT,
     continuum_code          VARCHAR(20),
     starting_hourly_wage    DECIMAL(10,2),
-    -- lineage
     source_system           VARCHAR(50),
     source_record_id        VARCHAR(50),
     source_enrollment_id    VARCHAR(50),
@@ -279,8 +297,6 @@ CREATE TABLE fact_enrollment (
     load_datetime           DATETIME2(6)
 );
 
--- Grain: one row per service per enrollment.
--- client_key denormalized; validate on load against fact_enrollment.
 CREATE TABLE fact_service (
     service_key             BIGINT IDENTITY NOT NULL,
     client_key              BIGINT,
@@ -309,7 +325,6 @@ CREATE TABLE fact_service (
 );
 
 -- RESTRICTED: note_title and note_content are free text.
--- program_key derives through enrollment_key.
 CREATE TABLE fact_case_note (
     note_key                BIGINT IDENTITY NOT NULL,
     client_key              BIGINT,
@@ -350,6 +365,18 @@ CREATE TABLE stage_load_log (
     error_message           VARCHAR(MAX)
 );
 
+CREATE TABLE stage_load_reject (
+    reject_key           BIGINT IDENTITY NOT NULL,
+    source_system        VARCHAR(50),
+    entity_name          VARCHAR(100),
+    source_record_id     VARCHAR(50),
+    reject_reason        VARCHAR(100),
+    referenced_client_id VARCHAR(50),
+    referenced_program   VARCHAR(255),
+    detected_datetime    DATETIME2(6),
+    raw_payload          VARCHAR(MAX)
+);
+
 -- ---------------------------------------------------------------------
 -- CONSTRAINTS (NONCLUSTERED NOT ENFORCED — Fabric limitation)
 -- ---------------------------------------------------------------------
@@ -368,6 +395,8 @@ ALTER TABLE dim_date ADD CONSTRAINT PK_dim_date
     PRIMARY KEY NONCLUSTERED (date_key) NOT ENFORCED;
 ALTER TABLE bridge_household_client ADD CONSTRAINT PK_bridge_household_client
     PRIMARY KEY NONCLUSTERED (household_client_key) NOT ENFORCED;
+ALTER TABLE bridge_client_source ADD CONSTRAINT PK_bridge_client_source
+    PRIMARY KEY NONCLUSTERED (client_source_key) NOT ENFORCED;
 ALTER TABLE fact_enrollment ADD CONSTRAINT PK_fact_enrollment
     PRIMARY KEY NONCLUSTERED (enrollment_key) NOT ENFORCED;
 ALTER TABLE fact_service ADD CONSTRAINT PK_fact_service
@@ -376,6 +405,8 @@ ALTER TABLE fact_case_note ADD CONSTRAINT PK_fact_case_note
     PRIMARY KEY NONCLUSTERED (note_key) NOT ENFORCED;
 ALTER TABLE stage_load_log ADD CONSTRAINT PK_stage_load_log
     PRIMARY KEY NONCLUSTERED (load_log_key) NOT ENFORCED;
+ALTER TABLE stage_load_reject ADD CONSTRAINT PK_stage_load_reject
+    PRIMARY KEY NONCLUSTERED (reject_key) NOT ENFORCED;
 
 ALTER TABLE dim_client ADD CONSTRAINT FK_dim_client_household
     FOREIGN KEY (household_key) REFERENCES dim_household(household_key) NOT ENFORCED;
@@ -388,6 +419,9 @@ ALTER TABLE bridge_household_client ADD CONSTRAINT FK_bridge_household_client_cl
     FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
 ALTER TABLE bridge_household_client ADD CONSTRAINT FK_bridge_household_client_enrollment
     FOREIGN KEY (enrollment_key) REFERENCES fact_enrollment(enrollment_key) NOT ENFORCED;
+
+ALTER TABLE bridge_client_source ADD CONSTRAINT FK_bridge_client_source_client
+    FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
 
 ALTER TABLE fact_enrollment ADD CONSTRAINT FK_fact_enrollment_client
     FOREIGN KEY (client_key) REFERENCES dim_client(client_key) NOT ENFORCED;
@@ -418,8 +452,10 @@ SELECT TABLE_NAME, COUNT(*) AS column_count
 FROM INFORMATION_SCHEMA.COLUMNS
 WHERE TABLE_NAME IN (
     'dim_household','dim_organization','dim_client','dim_program',
-    'dim_service_item','dim_date','bridge_household_client',
-    'fact_enrollment','fact_service','fact_case_note','stage_load_log'
+    'dim_service_item','dim_date',
+    'bridge_household_client','bridge_client_source',
+    'fact_enrollment','fact_service','fact_case_note',
+    'stage_load_log','stage_load_reject'
 )
 GROUP BY TABLE_NAME
 ORDER BY TABLE_NAME;
