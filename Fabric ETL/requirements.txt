@@ -1,0 +1,9 @@
+# Tested with Python 3.11 and 3.13 and Java 21 (PySpark 3.5 needs Java 17 or 21)
+pyspark==3.5.3
+splink==4.0.17
+duckdb==2.0.0
+sqlglot==30.29.0
+pandas==3.0.5
+pyarrow==26.0.1
+pytz==2026.6          # DuckDB needs it to return timestamps with time zones
+setuptools==84.0.0   # PySpark 3.5 imports distutils, which Python 3.12+ no longer ships; setuptools provides it
